@@ -47,8 +47,9 @@ class SiteConfig:
 
 
 # Generous defaults inferred from our scout.
+# altex sits behind Akamai Bot Manager so it gets the most defensive cooldown.
 SITE_COOLDOWN_DEFAULTS: dict[str, float] = {
-    "altex": 60.0,
+    "altex": 120.0,
     "emag": 15.0,
     "flanco": 10.0,
     "trendyol": 5.0,

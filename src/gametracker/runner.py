@@ -76,10 +76,12 @@ def _row_from_observation(
     prior_low: float | None = None,
     prior_count: int | None = None,
 ) -> DisplayRow:
+    # Historic low and count are tracked per (query, site, is_used) so new and SH
+    # have independent baselines.
     if prior_low is None and obs.status == "ok":
-        prior_low = db.historic_low(conn, obs.normalized_query, site)
+        prior_low = db.historic_low(conn, obs.normalized_query, site, is_used=obs.is_used)
     if prior_count is None and obs.status == "ok":
-        prior_count = db.observation_count(conn, obs.normalized_query, site)
+        prior_count = db.observation_count(conn, obs.normalized_query, site, is_used=obs.is_used)
     first = (prior_count == 0) if (prior_count is not None and obs.status == "ok") else False
     return DisplayRow(
         site=site,
@@ -126,19 +128,21 @@ async def run_check(
     conn = db.connect()
     now = datetime.now(timezone.utc)
 
-    # Pull cached observations inside TTL (unless --force).
-    cached: dict[str, Observation] = {}
+    # Pull cached observations inside TTL (unless --force). Each site can have up to
+    # two cached observations: one new and one SH.
+    cached_variants: dict[str, list[Observation]] = {}
     if not force:
         for s in targeted:
-            obs = db.latest_observation(conn, normalized, s)
-            if obs and _fresh(obs.scraped_at, now):
-                cached[s] = obs
+            variants = db.latest_observations(conn, normalized, s)
+            fresh_variants = [o for o in variants if _fresh(o.scraped_at, now)]
+            if fresh_variants:
+                cached_variants[s] = fresh_variants
 
-    to_fetch = [s for s in targeted if s not in cached]
+    to_fetch = [s for s in targeted if s not in cached_variants]
 
     if progress:
         for s in targeted:
-            progress(s, "cache" if s in cached else "fetching")
+            progress(s, "cache" if s in cached_variants else "fetching")
 
     async def _run(site: str) -> tuple[str, SiteResult]:
         if clients:
@@ -163,34 +167,43 @@ async def run_check(
 
     rows: list[DisplayRow] = []
     for s in targeted:
-        if s in cached:
-            rows.append(_row_from_observation(conn, s, cached[s], from_cache=True))
+        if s in cached_variants:
+            for obs in cached_variants[s]:
+                rows.append(_row_from_observation(conn, s, obs, from_cache=True))
             continue
 
         site_result = fetched.get(s)
         if site_result is None:
             continue
 
-        # Snapshot "what we knew before this fetch" so vs-low compares against history.
-        prior_low = db.historic_low(conn, normalized, s)
-        prior_count = db.observation_count(conn, normalized, s)
+        site_rows: list[DisplayRow] = []
+        final_status = site_result.status
 
         if site_result.status == OK:
             mr = match(display, site_result.candidates)
-            if mr.winner is not None:
-                w = mr.winner
-                obs = Observation(
-                    normalized_query=normalized,
-                    site=s,
-                    matched_title=w.title,
-                    price_ron=w.price_ron,
-                    url=w.url,
-                    availability=w.availability,
-                    is_used=w.is_used,
-                    status="ok",
-                    strategy_used=site_result.strategy_used,
-                    scraped_at=db.now_iso(),
-                )
+            if mr.winners:
+                for winner in mr.winners:
+                    prior_low = db.historic_low(conn, normalized, s, is_used=winner.is_used)
+                    prior_count = db.observation_count(conn, normalized, s, is_used=winner.is_used)
+                    obs = Observation(
+                        normalized_query=normalized,
+                        site=s,
+                        matched_title=winner.title,
+                        price_ron=winner.price_ron,
+                        url=winner.url,
+                        availability=winner.availability,
+                        is_used=winner.is_used,
+                        status="ok",
+                        strategy_used=site_result.strategy_used,
+                        scraped_at=db.now_iso(),
+                    )
+                    db.record_observation(conn, obs)
+                    row = _row_from_observation(
+                        conn, s, obs, from_cache=False,
+                        prior_low=prior_low, prior_count=prior_count,
+                    )
+                    site_rows.append(row)
+                final_status = "ok"
             else:
                 obs = Observation(
                     normalized_query=normalized,
@@ -204,6 +217,9 @@ async def run_check(
                     strategy_used=site_result.strategy_used,
                     scraped_at=db.now_iso(),
                 )
+                db.record_observation(conn, obs)
+                site_rows.append(_row_from_observation(conn, s, obs, from_cache=False))
+                final_status = "no_match"
         else:
             obs = Observation(
                 normalized_query=normalized,
@@ -217,19 +233,15 @@ async def run_check(
                 strategy_used=None,
                 scraped_at=db.now_iso(),
             )
+            db.record_observation(conn, obs)
+            site_rows.append(_row_from_observation(conn, s, obs, from_cache=False))
 
-        db.record_observation(conn, obs)
-        row = _row_from_observation(
-            conn, s, obs, from_cache=False,
-            prior_low=prior_low, prior_count=prior_count,
-        )
-        row.error = site_result.error
+        for r in site_rows:
+            r.error = site_result.error
+        if progress and final_status in ("ok", "no_match"):
+            progress(s, final_status)
 
-        # Notify progress: now that matching ran, we can distinguish ok vs no_match.
-        if progress and row.status in ("ok", "no_match"):
-            progress(s, row.status)
-
-        rows.append(row)
+        rows.extend(site_rows)
 
     return display, rows
 

@@ -1,13 +1,25 @@
 """SQLite storage for favorites and price observations."""
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-DB_PATH = Path.home() / ".gametracker" / "db.sqlite"
+
+def _default_db_path() -> Path:
+    """Return the DB path. GAMETRACKER_DB env var overrides — useful for tests
+    so real user data in ~/.gametracker never gets touched."""
+    override = os.environ.get("GAMETRACKER_DB")
+    if override:
+        return Path(override)
+    return Path.home() / ".gametracker" / "db.sqlite"
+
+
+DB_PATH = _default_db_path()
 
 SCHEMA_VERSION = 1
 
@@ -60,13 +72,28 @@ class Observation:
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
-    p = path or DB_PATH
+    p = path or _default_db_path()
     p.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_backup(p)
     conn = sqlite3.connect(p, detect_types=sqlite3.PARSE_DECLTYPES)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
+
+
+def _rotate_backup(db_path: Path) -> None:
+    """Copy the existing DB to <name>.bak before we open it.
+
+    Cheap defensive backup — a single .bak overwritten each run. If the tool
+    corrupts or someone rm's the DB, the .bak still has the pre-run state.
+    """
+    try:
+        if db_path.exists() and db_path.stat().st_size > 0:
+            shutil.copyfile(db_path, db_path.with_suffix(db_path.suffix + ".bak"))
+    except Exception:
+        # Backup failures must never block the app.
+        pass
 
 
 def add_favorite(conn: sqlite3.Connection, normalized: str, display: str) -> bool:
@@ -108,16 +135,19 @@ def record_observation(conn: sqlite3.Connection, obs: Observation) -> None:
 
 
 def latest_observation(
-    conn: sqlite3.Connection, normalized: str, site: str
+    conn: sqlite3.Connection, normalized: str, site: str,
+    is_used: bool | None = None,
 ) -> Observation | None:
-    row = conn.execute(
-        """SELECT normalized_query, site, matched_title, price_ron, url, availability,
-                  is_used, status, strategy_used, scraped_at
-           FROM price_observations
-           WHERE normalized_query = ? AND site = ?
-           ORDER BY scraped_at DESC LIMIT 1""",
-        (normalized, site),
-    ).fetchone()
+    sql = """SELECT normalized_query, site, matched_title, price_ron, url, availability,
+                    is_used, status, strategy_used, scraped_at
+             FROM price_observations
+             WHERE normalized_query = ? AND site = ?"""
+    args: list = [normalized, site]
+    if is_used is not None:
+        sql += " AND is_used = ?"
+        args.append(int(is_used))
+    sql += " ORDER BY scraped_at DESC LIMIT 1"
+    row = conn.execute(sql, args).fetchone()
     if row is None:
         return None
     d = dict(row)
@@ -125,27 +155,63 @@ def latest_observation(
     return Observation(**d)
 
 
-def historic_low(
+def latest_observations(
     conn: sqlite3.Connection, normalized: str, site: str
+) -> list[Observation]:
+    """Return the latest `ok` observation per is_used variant (up to 2 rows)."""
+    out: list[Observation] = []
+    for is_used in (False, True):
+        obs = latest_observation(conn, normalized, site, is_used=is_used)
+        if obs is not None and obs.status == "ok":
+            out.append(obs)
+    return out
+
+
+def historic_low(
+    conn: sqlite3.Connection, normalized: str, site: str,
+    is_used: bool | None = None,
 ) -> float | None:
-    row = conn.execute(
-        """SELECT MIN(price_ron) AS lo FROM price_observations
-           WHERE normalized_query = ? AND site = ? AND price_ron IS NOT NULL
-             AND status = 'ok'""",
-        (normalized, site),
-    ).fetchone()
+    sql = """SELECT MIN(price_ron) AS lo FROM price_observations
+             WHERE normalized_query = ? AND site = ? AND price_ron IS NOT NULL
+               AND status = 'ok'"""
+    args: list = [normalized, site]
+    if is_used is not None:
+        sql += " AND is_used = ?"
+        args.append(int(is_used))
+    row = conn.execute(sql, args).fetchone()
     return row["lo"] if row and row["lo"] is not None else None
 
 
 def observation_count(
-    conn: sqlite3.Connection, normalized: str, site: str
+    conn: sqlite3.Connection, normalized: str, site: str,
+    is_used: bool | None = None,
 ) -> int:
-    row = conn.execute(
-        """SELECT COUNT(*) AS n FROM price_observations
-           WHERE normalized_query = ? AND site = ? AND status = 'ok'""",
-        (normalized, site),
-    ).fetchone()
+    sql = """SELECT COUNT(*) AS n FROM price_observations
+             WHERE normalized_query = ? AND site = ? AND status = 'ok'"""
+    args: list = [normalized, site]
+    if is_used is not None:
+        sql += " AND is_used = ?"
+        args.append(int(is_used))
+    row = conn.execute(sql, args).fetchone()
     return int(row["n"]) if row else 0
+
+
+def historic_low_global(
+    conn: sqlite3.Connection, normalized: str, is_used: bool,
+) -> tuple[float, str] | None:
+    """Cheapest price ever recorded across ANY site for this (game, variant),
+    plus the site it came from. Returns None if no data."""
+    row = conn.execute(
+        """SELECT price_ron, site FROM price_observations
+           WHERE normalized_query = ? AND is_used = ? AND status = 'ok'
+             AND price_ron IS NOT NULL
+           ORDER BY price_ron ASC, scraped_at ASC
+           LIMIT 1""",
+        (normalized, int(is_used)),
+    ).fetchone()
+    if row is None:
+        return None
+    return float(row["price_ron"]), str(row["site"])
 
 
 def iter_history(

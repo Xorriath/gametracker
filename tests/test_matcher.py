@@ -34,6 +34,7 @@ def test_picks_cheapest_when_no_edition():
     ]
     r = match("resident evil requiem", cands)
     assert r.winner is not None
+    assert r.winners
     assert r.winner.price_ron == 369
     assert "Deluxe" not in r.winner.title
 
@@ -57,6 +58,7 @@ def test_ps5_filter_excludes_other_platforms():
     ]
     r = match("resident evil requiem", cands)
     assert r.winner is not None
+    assert r.winners
     assert "PS5" in r.winner.title
 
 
@@ -69,7 +71,22 @@ def test_below_min_score_rejected():
 def test_empty_candidates():
     r = match("anything", [])
     assert r.winner is None
-    assert r.score is None
+    assert r.winners == []
+
+
+def test_returns_both_new_and_sh_when_present():
+    cands = [
+        c("Joc PS5 Silent Hill 2 Remake", 199, used=False),
+        c("Joc PS5 Silent Hill 2 Remake Second-Hand SH", 149, used=True),
+    ]
+    r = match("silent hill 2 remake", cands)
+    assert len(r.winners) == 2
+    used = [w for w in r.winners if w.is_used]
+    new = [w for w in r.winners if not w.is_used]
+    assert len(used) == 1 and used[0].price_ron == 149
+    assert len(new) == 1 and new[0].price_ron == 199
+    # backward-compat single winner = cheapest
+    assert r.winner.price_ron == 149
 
 
 def test_used_keyword_in_query():
@@ -89,4 +106,5 @@ def test_base_edition_preferred_on_ties():
     ]
     r = match("resident evil requiem", cands)
     assert r.winner is not None
+    assert r.winners
     assert "Deluxe" not in r.winner.title

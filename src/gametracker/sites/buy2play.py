@@ -10,7 +10,8 @@ import re
 from urllib.parse import quote_plus
 
 from ..client import BlockedError, RateLimited, SiteClient
-from ..matcher import Candidate
+from ..matcher import Candidate, STOPWORDS
+from ..normalize import normalize_query
 from ..price import PriceParseError, parse_price
 from .types import BLOCKED, ERROR, OK, SiteResult
 
@@ -24,8 +25,17 @@ BASE = "https://buy2play.ro"
 _SH_RE = re.compile(r"\b(sh|second[\s-]?hand)\b", re.IGNORECASE)
 
 
+def _shopify_query(query: str) -> str:
+    """Strip connector stopwords — Shopify's suggest.json AND-matches every
+    token, and buy2play titles often use `&` where the query uses `and`.
+    """
+    norm = normalize_query(query)
+    kept = [t for t in norm.split() if t and t not in STOPWORDS and len(t) >= 2]
+    return " ".join(kept) if kept else norm
+
+
 def _build_url(query: str, limit: int = 10) -> str:
-    q = quote_plus(query)
+    q = quote_plus(_shopify_query(query))
     return (
         f"{BASE}/search/suggest.json?q={q}"
         f"&resources%5Btype%5D=product&resources%5Blimit%5D={limit}"

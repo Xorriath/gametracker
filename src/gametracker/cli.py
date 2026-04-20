@@ -12,7 +12,7 @@ from . import db
 from .normalize import normalize_query
 from .client import SITE_COOLDOWN_DEFAULTS
 from .history import build_history
-from .render import StatusDisplay, render_errors, render_history, render_table
+from .render import StatusDisplay, render_errors, render_history, render_summary, render_table
 from .runner import run_check, run_favorites
 from .sites import REGISTRY
 
@@ -20,7 +20,6 @@ app = typer.Typer(
     name="gametracker",
     help="Romanian PS5 price tracker.",
     no_args_is_help=True,
-    add_completion=False,
 )
 
 console = Console()
@@ -122,9 +121,29 @@ def check(
 
 
 @app.command()
-def favorites(ctx: typer.Context) -> None:
+def favorites(
+    ctx: typer.Context,
+    site: Annotated[
+        str | None,
+        typer.Argument(help="Optional: limit to a single site (e.g. 'buy2play')."),
+    ] = None,
+    summary: Annotated[
+        bool,
+        typer.Option("--summary", help="After all games check, show a compact best-price table."),
+    ] = False,
+) -> None:
     """Check all saved favorites."""
     state: CtxState = ctx.obj
+
+    sites_override = state.sites
+    if site:
+        name = site.strip().lower()
+        if name not in REGISTRY:
+            err_console.print(
+                f"[red]unknown site {name!r}[/red]; known: {', '.join(sorted(REGISTRY.keys()))}"
+            )
+            raise typer.Exit(code=2)
+        sites_override = [name]
 
     # One live display per game: created on start, updates, closes to flush when the
     # game's table is ready to print. The next game opens its own display.
@@ -148,7 +167,7 @@ def favorites(ctx: typer.Context) -> None:
     try:
         results = asyncio.run(
             run_favorites(
-                sites=state.sites,
+                sites=sites_override,
                 force=state.force,
                 cooldown_overrides=state.cooldown,
                 per_game_progress=per_game_progress,
@@ -162,6 +181,9 @@ def favorites(ctx: typer.Context) -> None:
 
     if not results:
         console.print("[dim]no favorites yet — add some with `gametracker add \"Game Name\"`[/dim]")
+        return
+    if summary:
+        render_summary(results, console)
 
 
 @app.command()
@@ -226,6 +248,84 @@ def history(
     with db.connect() as conn:
         histories = build_history(conn, game)
     render_history(game.strip(), histories, console)
+
+
+@app.command()
+def best(
+    ctx: typer.Context,
+    game: Annotated[
+        str | None,
+        typer.Argument(help="Optional: show best price for a single game only."),
+    ] = None,
+) -> None:
+    """Show the best known price per game from the DB (no scraping)."""
+    from .runner import DisplayRow  # local import to avoid a cycle
+
+    with db.connect() as conn:
+        if game:
+            nq = normalize_query(game)
+            if not nq:
+                err_console.print("[red]empty game name[/red]")
+                raise typer.Exit(code=2)
+            queries = [(nq, game.strip())]
+        else:
+            favs = db.list_favorites(conn)
+            if not favs:
+                console.print("[dim]no favorites yet — add some with `gametracker add \"Game Name\"`[/dim]")
+                return
+            queries = [(f.normalized_query, f.display_query) for f in favs]
+
+        games: list[tuple[str, list[DisplayRow]]] = []
+        global_lows: dict[tuple[str, bool], tuple[float, str]] = {}
+        for nq, display_name in queries:
+            rows: list[DisplayRow] = []
+            for site in REGISTRY.keys():
+                for obs in db.latest_observations(conn, nq, site):
+                    lo = db.historic_low(conn, nq, site, is_used=obs.is_used)
+                    cnt = db.observation_count(conn, nq, site, is_used=obs.is_used)
+                    rows.append(DisplayRow(
+                        site=site,
+                        status=obs.status,
+                        matched_title=obs.matched_title,
+                        price_ron=obs.price_ron,
+                        url=obs.url,
+                        availability=obs.availability,
+                        is_used=obs.is_used,
+                        low=lo,
+                        is_first_check=(cnt <= 1),
+                        strategy_used=obs.strategy_used,
+                        from_cache=True,
+                    ))
+            # Cross-site historic low per variant for this game.
+            for used_flag in (False, True):
+                gl = db.historic_low_global(conn, nq, used_flag)
+                if gl is not None:
+                    global_lows[(display_name, used_flag)] = gl
+            games.append((display_name, rows))
+
+    render_summary(games, console, single_game=(game is not None), global_lows=global_lows)
+
+
+@app.command(name="all")
+def all_cmd(
+    ctx: typer.Context,
+    game: Annotated[
+        str | None,
+        typer.Argument(help="Optional: limit the dump to a single game."),
+    ] = None,
+) -> None:
+    """Dump every recorded price observation — game × site × current × low."""
+    from .render import render_all
+
+    filter_nq: str | None = None
+    if game:
+        filter_nq = normalize_query(game)
+        if not filter_nq:
+            err_console.print("[red]empty game name[/red]")
+            raise typer.Exit(code=2)
+
+    with db.connect() as conn:
+        render_all(conn, console, filter_normalized=filter_nq)
 
 
 if __name__ == "__main__":

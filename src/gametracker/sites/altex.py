@@ -24,6 +24,38 @@ NAME = "altex"
 BASE = "https://altex.ro"
 _API = "https://fenrir.altex.ro/v2/catalog/search"
 
+# Cookie names set by Akamai Bot Manager on any real-browser visit to altex.ro.
+# Presence of _abck + bm_sz in our jar greatly improves how we look to fenrir.
+_AKAMAI_COOKIES = ("_abck", "bm_sz", "bm_sv")
+
+
+def _has_akamai_cookies(client: SiteClient) -> bool:
+    session = client._session  # type: ignore[attr-defined]
+    if session is None:
+        return False
+    try:
+        jar = getattr(session.cookies, "jar", None) or session.cookies
+        names: set[str] = set()
+        for cookie in jar:
+            names.add(cookie.name)
+        return any(n in names for n in _AKAMAI_COOKIES)
+    except Exception:
+        return False
+
+
+async def _warmup(client: SiteClient) -> None:
+    """Visit altex.ro/ once per session so Akamai sets defense cookies we can
+    carry on subsequent fenrir calls. Skipped if we already have those cookies."""
+    if _has_akamai_cookies(client):
+        return
+    try:
+        await client.get(BASE + "/")
+    except (BlockedError, RateLimited):
+        # If the warmup itself is blocked, fall through — fenrir might still work.
+        pass
+    except Exception as e:
+        log.debug("altex warmup failed: %s", e)
+
 # Matches labels like "-20% extra in app" / "-25% extra aplicatie" / "-10% EXTRA"
 _APP_DISCOUNT_RE = re.compile(r"-\s*(\d{1,2})\s*%\s*extra", re.IGNORECASE)
 
@@ -101,6 +133,8 @@ def parse_products(data: Any) -> list[Candidate]:
 
 
 async def search(client: SiteClient, query: str) -> SiteResult:
+    await _warmup(client)
+
     url = _build_api_url(query)
     try:
         r = await client.get(

@@ -62,6 +62,11 @@ USED_MARKERS: tuple[str, ...] = (
     "sh",
 )
 
+_USED_RE = re.compile(
+    r"\b(" + "|".join(re.escape(m) for m in USED_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -75,8 +80,14 @@ class Candidate:
 
 @dataclass(frozen=True)
 class MatchResult:
-    winner: Candidate | None
-    score: float | None  # fuzzy score of the winning candidate, None if no match
+    winners: list[Candidate]  # 0, 1, or 2: cheapest-new and/or cheapest-SH
+
+    @property
+    def winner(self) -> Candidate | None:
+        """Backward-compat: single cheapest across new and SH."""
+        if not self.winners:
+            return None
+        return min(self.winners, key=lambda c: c.price_ron)
 
 
 def _norm(s: str) -> str:
@@ -103,7 +114,9 @@ def detect_platform_ps5(text_norm: str) -> bool:
 
 
 def detect_used(text_norm: str) -> bool:
-    return _contains_any(text_norm, USED_MARKERS)
+    """True if the text has a used/SH marker as a whole word (not a substring
+    of e.g. 'Shin' or 'Sheepshead')."""
+    return bool(_USED_RE.search(text_norm))
 
 
 def _significant_tokens(text_norm: str) -> list[str]:
@@ -141,9 +154,14 @@ def pre_filter_matches(query: str, title: str, url: str = "") -> bool:
 
 
 def match(query: str, candidates: list[Candidate]) -> MatchResult:
-    """Pick the best candidate for the query, or return empty MatchResult."""
+    """Pick the cheapest new and/or cheapest SH candidate for the query.
+
+    Returns up to two winners: one with is_used=False, one with is_used=True.
+    Both pass the platform/token/edition filters; the cheapest in each bucket wins.
+    If the query itself specifies SH, only SH candidates are considered.
+    """
     if not candidates:
-        return MatchResult(winner=None, score=None)
+        return MatchResult(winners=[])
 
     q_norm = _norm(query)
     q_editions = detect_editions(q_norm)
@@ -166,12 +184,10 @@ def match(query: str, candidates: list[Candidate]) -> MatchResult:
         # 3) edition filter
         t_editions = detect_editions(t_norm)
         if q_editions:
-            # query specifies — all query editions must be in title
             if not q_editions.issubset(t_editions):
                 continue
-        # if no edition specified, keep all editions (cheapest wins later)
 
-        # 4) used filter
+        # 4) hard used filter (only if the query explicitly asks for SH)
         if q_wants_used is True and not c.is_used:
             continue
 
@@ -183,14 +199,19 @@ def match(query: str, candidates: list[Candidate]) -> MatchResult:
         enriched.append((c, t_norm, t_editions, score))
 
     if not enriched:
-        return MatchResult(winner=None, score=None)
+        return MatchResult(winners=[])
 
-    # 5) Pick cheapest; prefer "base" (no edition or 'standard') on ties.
     def sort_key(item: tuple[Candidate, str, set[str], float]) -> tuple[float, int, float]:
         c, _t, edns, score = item
         is_non_base = 0 if (not edns or _BASE_EDITION_SENTINEL in edns) else 1
         return (c.price_ron, is_non_base, -score)
 
-    enriched.sort(key=sort_key)
-    winner, _t, _e, score = enriched[0]
-    return MatchResult(winner=winner, score=score)
+    winners: list[Candidate] = []
+    for used_flag in (False, True):
+        bucket = [e for e in enriched if e[0].is_used == used_flag]
+        if not bucket:
+            continue
+        bucket.sort(key=sort_key)
+        winners.append(bucket[0][0])
+
+    return MatchResult(winners=winners)
