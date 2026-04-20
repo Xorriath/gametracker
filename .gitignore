@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Playwright MCP test artifacts
+.playwright-mcp/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

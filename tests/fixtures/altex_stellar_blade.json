@@ -1,0 +1,21 @@
+{
+  "products": [
+    {
+      "id": 593339,
+      "name": "Joc Stellar Blade PS5",
+      "sku": "JOCPS5STELBLADE",
+      "price": 239.94,
+      "regular_price": 319.92,
+      "url_key": "joc-stellar-blade-ps5",
+      "stock_status": 1,
+      "discount_type": "percentage",
+      "label_actions_serialized": [
+        {
+          "title": "-20% extra in app",
+          "image": "/media/image/E/x/Extra-reducere.png",
+          "type": "generic"
+        }
+      ]
+    }
+  ]
+}
