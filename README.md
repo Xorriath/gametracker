@@ -5,7 +5,7 @@ Romanian game price tracker CLI. On-demand lookups across 7 Romanian retailers f
 ## Install
 
 ```bash
-pipx install git+https://github.com/<user>/gametracker.git
+pipx install git+https://github.com/Xorriath/gametracker.git
 ```
 
 Nothing else needed — no browser binaries, no extra setup.
