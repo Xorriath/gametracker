@@ -182,6 +182,25 @@ def historic_low(
     return row["lo"] if row and row["lo"] is not None else None
 
 
+def historic_low_with_date(
+    conn: sqlite3.Connection, normalized: str, site: str,
+    is_used: bool | None = None,
+) -> tuple[float, str] | None:
+    """Per-site historic low plus the date it was recorded. Ties break by earliest date."""
+    sql = """SELECT price_ron, scraped_at FROM price_observations
+             WHERE normalized_query = ? AND site = ? AND price_ron IS NOT NULL
+               AND status = 'ok'"""
+    args: list = [normalized, site]
+    if is_used is not None:
+        sql += " AND is_used = ?"
+        args.append(int(is_used))
+    sql += " ORDER BY price_ron ASC, scraped_at ASC LIMIT 1"
+    row = conn.execute(sql, args).fetchone()
+    if row is None or row["price_ron"] is None:
+        return None
+    return float(row["price_ron"]), str(row["scraped_at"])
+
+
 def observation_count(
     conn: sqlite3.Connection, normalized: str, site: str,
     is_used: bool | None = None,
@@ -198,11 +217,11 @@ def observation_count(
 
 def historic_low_global(
     conn: sqlite3.Connection, normalized: str, is_used: bool,
-) -> tuple[float, str] | None:
+) -> tuple[float, str, str] | None:
     """Cheapest price ever recorded across ANY site for this (game, variant),
-    plus the site it came from. Returns None if no data."""
+    plus the site and date it came from. Returns None if no data."""
     row = conn.execute(
-        """SELECT price_ron, site FROM price_observations
+        """SELECT price_ron, site, scraped_at FROM price_observations
            WHERE normalized_query = ? AND is_used = ? AND status = 'ok'
              AND price_ron IS NOT NULL
            ORDER BY price_ron ASC, scraped_at ASC
@@ -211,7 +230,7 @@ def historic_low_global(
     ).fetchone()
     if row is None:
         return None
-    return float(row["price_ron"]), str(row["site"])
+    return float(row["price_ron"]), str(row["site"]), str(row["scraped_at"])
 
 
 def iter_history(

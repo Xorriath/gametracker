@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Annotated
 
 import typer
@@ -12,7 +13,15 @@ from . import db
 from .normalize import normalize_query
 from .client import SITE_COOLDOWN_DEFAULTS
 from .history import build_history
-from .render import StatusDisplay, render_errors, render_history, render_summary, render_table
+from .render import (
+    StatusDisplay,
+    render_errors,
+    render_graph,
+    render_history,
+    render_run_summary,
+    render_summary,
+    render_table,
+)
 from .runner import run_check, run_favorites
 from .sites import REGISTRY
 
@@ -109,15 +118,18 @@ def check(
                 progress=live.update,
             )
 
+    started = time.monotonic()
     try:
         display, rows = asyncio.run(_go())
     except ValueError as e:
         err_console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2)
+    elapsed = time.monotonic() - started
 
     render_table(display, rows, console)
     if state.verbose:
         render_errors(rows, err_console)
+    render_run_summary([(display, rows)], console, elapsed_seconds=elapsed)
 
 
 @app.command()
@@ -164,6 +176,7 @@ def favorites(
         if state.verbose:
             render_errors(rows, err_console)
 
+    started = time.monotonic()
     try:
         results = asyncio.run(
             run_favorites(
@@ -178,12 +191,14 @@ def favorites(
         if current[0] is not None:
             current[0].__exit__(None, None, None)
             current[0] = None
+    elapsed = time.monotonic() - started
 
     if not results:
         console.print("[dim]no favorites yet — add some with `gametracker add \"Game Name\"`[/dim]")
         return
     if summary:
         render_summary(results, console)
+    render_run_summary(results, console, elapsed_seconds=elapsed)
 
 
 @app.command()
@@ -251,6 +266,26 @@ def history(
 
 
 @app.command()
+def graph(
+    ctx: typer.Context,
+    game: Annotated[str, typer.Argument(help="Game name to plot.")],
+    site: Annotated[
+        str | None,
+        typer.Option("--site", help="Limit the plot to a single site (e.g. 'emag')."),
+    ] = None,
+) -> None:
+    """Plot price evolution over time for a single game (all sites)."""
+    display = game.strip()
+    nq = normalize_query(display)
+    if not nq:
+        err_console.print("[red]empty game name[/red]")
+        raise typer.Exit(code=2)
+    with db.connect() as conn:
+        observations = list(db.iter_history(conn, nq))
+    render_graph(display, observations, console, site_filter=site)
+
+
+@app.command()
 def best(
     ctx: typer.Context,
     game: Annotated[
@@ -276,12 +311,14 @@ def best(
             queries = [(f.normalized_query, f.display_query) for f in favs]
 
         games: list[tuple[str, list[DisplayRow]]] = []
-        global_lows: dict[tuple[str, bool], tuple[float, str]] = {}
+        global_lows: dict[tuple[str, bool], tuple[float, str, str]] = {}
         for nq, display_name in queries:
             rows: list[DisplayRow] = []
             for site in REGISTRY.keys():
                 for obs in db.latest_observations(conn, nq, site):
-                    lo = db.historic_low(conn, nq, site, is_used=obs.is_used)
+                    lo_detail = db.historic_low_with_date(conn, nq, site, is_used=obs.is_used)
+                    lo = lo_detail[0] if lo_detail else None
+                    lo_at = lo_detail[1] if lo_detail else None
                     cnt = db.observation_count(conn, nq, site, is_used=obs.is_used)
                     rows.append(DisplayRow(
                         site=site,
@@ -295,6 +332,8 @@ def best(
                         is_first_check=(cnt <= 1),
                         strategy_used=obs.strategy_used,
                         from_cache=True,
+                        scraped_at=obs.scraped_at,
+                        low_at=lo_at,
                     ))
             # Cross-site historic low per variant for this game.
             for used_flag in (False, True):

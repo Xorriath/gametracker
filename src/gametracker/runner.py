@@ -36,6 +36,8 @@ class DisplayRow:
     strategy_used: str | None
     from_cache: bool
     error: str | None = None
+    scraped_at: str | None = None  # when this observation was recorded
+    low_at: str | None = None      # when the historic low for this (site, variant) was hit
 
 
 def _fresh(iso_str: str, now: datetime) -> bool:
@@ -78,10 +80,17 @@ def _row_from_observation(
 ) -> DisplayRow:
     # Historic low and count are tracked per (query, site, is_used) so new and SH
     # have independent baselines.
-    if prior_low is None and obs.status == "ok":
-        prior_low = db.historic_low(conn, obs.normalized_query, site, is_used=obs.is_used)
-    if prior_count is None and obs.status == "ok":
-        prior_count = db.observation_count(conn, obs.normalized_query, site, is_used=obs.is_used)
+    low_at: str | None = None
+    if obs.status == "ok":
+        detail = db.historic_low_with_date(conn, obs.normalized_query, site, is_used=obs.is_used)
+        if detail is not None:
+            # If caller supplied prior_low (pre-insert snapshot), keep it so the
+            # "new low!" flag stays correct; otherwise use the fresh value.
+            if prior_low is None:
+                prior_low = detail[0]
+            low_at = detail[1]
+        if prior_count is None:
+            prior_count = db.observation_count(conn, obs.normalized_query, site, is_used=obs.is_used)
     first = (prior_count == 0) if (prior_count is not None and obs.status == "ok") else False
     return DisplayRow(
         site=site,
@@ -95,6 +104,8 @@ def _row_from_observation(
         is_first_check=first,
         strategy_used=obs.strategy_used,
         from_cache=from_cache,
+        scraped_at=obs.scraped_at,
+        low_at=low_at,
     )
 
 

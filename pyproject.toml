@@ -16,6 +16,7 @@ dependencies = [
     "rich>=13.7",
     "tenacity>=8.5",
     "selectolax>=0.3",
+    "plotext>=5.2",
 ]
 
 [project.optional-dependencies]

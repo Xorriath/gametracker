@@ -14,7 +14,9 @@ SPARK_CHARS = "▁▂▃▄▅▆▇█"
 class SiteHistory:
     site: str
     latest: float
+    latest_at: str
     low: float
+    low_at: str
     high: float
     count: int
     sparkline: str
@@ -40,18 +42,23 @@ def sparkline(values: list[float]) -> str:
 
 def build_history(conn, display_query: str) -> list[SiteHistory]:
     nq = normalize_query(display_query)
-    by_site: dict[str, list[float]] = defaultdict(list)
+    by_site: dict[str, list[tuple[float, str]]] = defaultdict(list)
     for obs in db.iter_history(conn, nq):
         if obs.price_ron is None:
             continue
-        by_site[obs.site].append(obs.price_ron)
+        by_site[obs.site].append((obs.price_ron, obs.scraped_at))
 
     out: list[SiteHistory] = []
-    for site, vals in by_site.items():
+    for site, pairs in by_site.items():
+        vals = [p for p, _ in pairs]
+        latest_price, latest_at = pairs[-1]
+        low_price, low_at = min(pairs, key=lambda p: (p[0], p[1]))
         out.append(SiteHistory(
             site=site,
-            latest=vals[-1],
-            low=min(vals),
+            latest=latest_price,
+            latest_at=latest_at,
+            low=low_price,
+            low_at=low_at,
             high=max(vals),
             count=len(vals),
             sparkline=sparkline(vals),

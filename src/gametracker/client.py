@@ -10,6 +10,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,8 @@ from curl_cffi.requests import AsyncSession
 log = logging.getLogger(__name__)
 
 COOKIES_DIR = Path.home() / ".gametracker" / "cookies"
+FAILURE_LOG_PATH = Path.home() / ".gametracker" / "failures.log"
+FAILURE_BODY_LIMIT = 16384  # bytes of response body to keep per failure entry
 DEFAULT_IMPERSONATE = "firefox133"
 
 DEFAULT_HEADERS = {
@@ -49,7 +52,7 @@ class SiteConfig:
 # Generous defaults inferred from our scout.
 # altex sits behind Akamai Bot Manager so it gets the most defensive cooldown.
 SITE_COOLDOWN_DEFAULTS: dict[str, float] = {
-    "altex": 120.0,
+    "altex": 60.0,
     "emag": 15.0,
     "flanco": 10.0,
     "trendyol": 5.0,
@@ -95,6 +98,25 @@ class SiteClient:
                 )
             except Exception:
                 continue
+
+    def clear_cookies(self) -> None:
+        """Wipe the in-memory jar and delete the persisted cookie file.
+
+        Scrapers should call this after detecting a hard block (e.g. Akamai 403)
+        so the next run can start from a clean state instead of replaying the
+        poisoned cookies that got us blocked.
+        """
+        if self._session is not None:
+            try:
+                self._session.cookies.clear()
+            except Exception:
+                pass
+        try:
+            p = self.cookies_path
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
 
     def _save_cookies(self, session: AsyncSession) -> None:
         p = self.cookies_path
@@ -168,15 +190,30 @@ class SiteClient:
                     last_err = e
                     log.debug("%s: network error on %s: %s", self.cfg.name, url, e)
                     if attempt + 1 == self.cfg.retries:
+                        log_failure(
+                            self.cfg.name, url, kind="network",
+                            request_headers=hdrs, exception=e,
+                            extra={"attempt": attempt + 1, "retries": self.cfg.retries},
+                        )
                         raise
                     await asyncio.sleep(2 ** attempt)
                     continue
 
             if r.status_code == 403:
+                log_failure(
+                    self.cfg.name, url, kind="403",
+                    request_headers=hdrs, response=r,
+                    extra={"attempt": attempt + 1},
+                )
                 raise BlockedError(f"{self.cfg.name}: 403 on {url}")
             if r.status_code == 429:
                 delay = _parse_retry_after(r.headers.get("Retry-After")) or 10.0
                 if attempt + 1 == self.cfg.retries:
+                    log_failure(
+                        self.cfg.name, url, kind="429",
+                        request_headers=hdrs, response=r,
+                        extra={"attempt": attempt + 1, "retry_after": delay},
+                    )
                     raise RateLimited(f"{self.cfg.name}: 429 on {url}")
                 log.debug("%s: 429, retry after %.1fs", self.cfg.name, delay)
                 await asyncio.sleep(delay)
@@ -184,6 +221,14 @@ class SiteClient:
             if 500 <= r.status_code < 600 and attempt + 1 < self.cfg.retries:
                 await asyncio.sleep(2 ** attempt)
                 continue
+            if 500 <= r.status_code < 600:
+                # 5xx persisted across all retries — return the response so the
+                # caller sees it, but log the raw exchange for debugging first.
+                log_failure(
+                    self.cfg.name, url, kind="5xx",
+                    request_headers=hdrs, response=r,
+                    extra={"attempt": attempt + 1, "retries": self.cfg.retries},
+                )
 
             self._last_url = url
             return r
@@ -199,3 +244,72 @@ def _parse_retry_after(val: str | None) -> float | None:
         return float(val)
     except ValueError:
         return None
+
+
+def _safe_body_snippet(resp: Any) -> str:
+    """Best-effort extract of the response body, truncated and decoded as text."""
+    try:
+        raw = getattr(resp, "content", None)
+        if raw is None:
+            raw = getattr(resp, "text", "")
+            if isinstance(raw, str):
+                return raw[:FAILURE_BODY_LIMIT]
+            raw = bytes(raw or b"")
+        if isinstance(raw, (bytes, bytearray)):
+            trimmed = bytes(raw[:FAILURE_BODY_LIMIT])
+            try:
+                return trimmed.decode("utf-8", errors="replace")
+            except Exception:
+                return repr(trimmed)
+        return str(raw)[:FAILURE_BODY_LIMIT]
+    except Exception as e:
+        return f"<body-unavailable: {type(e).__name__}: {e}>"
+
+
+def log_failure(
+    site: str,
+    url: str,
+    *,
+    kind: str,
+    request_headers: dict[str, str] | None = None,
+    response: Any = None,
+    exception: BaseException | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Append a single JSON line describing a failed request to FAILURE_LOG_PATH.
+
+    Kind is a short tag: '403', '429', 'network', '5xx', etc. Response/exception
+    are both optional since some failures have a response and no exception and
+    vice versa. Never raises — log file problems must not kill the scrape.
+    """
+    entry: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "site": site,
+        "url": url,
+        "kind": kind,
+    }
+    if request_headers:
+        entry["request_headers"] = dict(request_headers)
+    if response is not None:
+        try:
+            entry["response_status"] = int(getattr(response, "status_code", 0))
+        except Exception:
+            entry["response_status"] = None
+        try:
+            entry["response_headers"] = dict(getattr(response, "headers", {}) or {})
+        except Exception:
+            entry["response_headers"] = None
+        entry["response_body"] = _safe_body_snippet(response)
+        entry["response_body_truncated_to"] = FAILURE_BODY_LIMIT
+    if exception is not None:
+        entry["exception_type"] = type(exception).__name__
+        entry["exception_message"] = str(exception)
+    if extra:
+        entry["extra"] = extra
+
+    try:
+        FAILURE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with FAILURE_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.debug("failed to write failure log: %s", e)

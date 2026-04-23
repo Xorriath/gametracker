@@ -44,9 +44,17 @@ def _has_akamai_cookies(client: SiteClient) -> bool:
 
 
 async def _warmup(client: SiteClient) -> None:
-    """Visit altex.ro/ once per session so Akamai sets defense cookies we can
-    carry on subsequent fenrir calls. Skipped if we already have those cookies."""
-    if _has_akamai_cookies(client):
+    """Visit altex.ro/ once per session so Akamai sets fresh defense cookies.
+
+    Runs unconditionally on the first call of a session even when cookies were
+    loaded from disk, because the saved `_abck`/`bm_sz` rot quickly (their
+    sensor-score decays, and curl_cffi never posts the Akamai-BM-Telemetry
+    signal a real browser would) and fenrir will 403 on first use otherwise.
+    On later calls within the same session we only re-warm if the cookies
+    have disappeared entirely.
+    """
+    already_warmed = bool(getattr(client, "_altex_warmed", False))
+    if already_warmed and _has_akamai_cookies(client):
         return
     try:
         await client.get(BASE + "/")
@@ -55,6 +63,9 @@ async def _warmup(client: SiteClient) -> None:
         pass
     except Exception as e:
         log.debug("altex warmup failed: %s", e)
+    # Mark this client as warmed regardless — we only want one homepage hit per
+    # session even if it failed, to avoid hammering Akamai further.
+    client._altex_warmed = True  # type: ignore[attr-defined]
 
 # Matches labels like "-20% extra in app" / "-25% extra aplicatie" / "-10% EXTRA"
 _APP_DISCOUNT_RE = re.compile(r"-\s*(\d{1,2})\s*%\s*extra", re.IGNORECASE)
@@ -143,8 +154,11 @@ async def search(client: SiteClient, query: str) -> SiteResult:
             referer=f"{BASE}/",
         )
     except BlockedError as e:
+        # Saved cookies are the usual culprit — wipe them so next run warms up clean.
+        client.clear_cookies()
         return SiteResult(site=NAME, status=BLOCKED, error=str(e))
     except RateLimited as e:
+        client.clear_cookies()
         return SiteResult(site=NAME, status=BLOCKED, error=str(e))
     except Exception as e:
         return SiteResult(site=NAME, status=ERROR, error=f"{type(e).__name__}: {e}")

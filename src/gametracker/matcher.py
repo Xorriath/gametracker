@@ -120,15 +120,53 @@ def detect_used(text_norm: str) -> bool:
 
 
 def _significant_tokens(text_norm: str) -> list[str]:
-    return [t for t in text_norm.split() if len(t) >= 2 and t not in STOPWORDS]
+    # Keep short numeric tokens (sequel numbers like "4" in "Ninja Gaiden 4")
+    # that would otherwise be filtered out by the length-2 cutoff.
+    return [
+        t for t in text_norm.split()
+        if t not in STOPWORDS and (len(t) >= 2 or t.isdigit())
+    ]
+
+
+def _adjacent_pairs_present(query_norm: str, title_norm: str) -> bool:
+    """Numeric query tokens must be adjacent to the preceding word in the title.
+
+    Prevents a title like "2× silicone grips Death Stranding PS5" from matching
+    "Death Stranding 2": both contain the tokens {death, stranding, 2, ps5}, but
+    only the real sequel has "stranding 2" as an adjacent token pair.
+
+    Only enforced for digit tokens that aren't the first token of the query —
+    those are the ones that carry sequel/version semantics.
+    """
+    q_tokens = query_norm.split()
+    title_tokens = title_norm.split()
+    if len(title_tokens) < 2:
+        return True
+    # Build the set of adjacent bigrams in the title for O(1) lookup.
+    title_bigrams = {
+        (title_tokens[i], title_tokens[i + 1])
+        for i in range(len(title_tokens) - 1)
+    }
+    for i, qt in enumerate(q_tokens):
+        if i == 0 or not qt.isdigit():
+            continue
+        prev = q_tokens[i - 1]
+        # Skip bigram check when the preceding token is a filler word — the
+        # query "the 5" makes no sense, but being defensive here avoids surprises.
+        if prev in STOPWORDS or len(prev) < 2:
+            continue
+        if (prev, qt) not in title_bigrams:
+            return False
+    return True
 
 
 def all_query_tokens_present(query_norm: str, title_norm: str) -> bool:
-    """Every significant query token must appear in the title."""
+    """Every significant query token must appear in the title, and any numeric
+    sequel token must sit adjacent to its preceding query word."""
     for qt in _significant_tokens(query_norm):
         if qt not in title_norm:
             return False
-    return True
+    return _adjacent_pairs_present(query_norm, title_norm)
 
 
 def pre_filter_matches(query: str, title: str, url: str = "") -> bool:
