@@ -67,6 +67,42 @@ _USED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Product categories that are NOT the game itself but often carry the game's
+# name in their title (cases, merch, DLC, etc.). Normalized form used (no
+# diacritics) since detection runs after `normalize_query`.
+# Multi-word phrases MUST be whole-word matches; single words are matched as
+# whole tokens to avoid false positives (e.g. "case" as a substring of "case").
+ACCESSORY_MARKERS: tuple[str, ...] = (
+    # Cases / covers (RO + EN)
+    "husa", "husa de protectie", "carcasa", "case", "cover",
+    # Skins / stickers / themes
+    "skin", "sticker", "autocolant", "theme",
+    # Grips / accessories
+    "grip", "maner", "manere",
+    # Collectibles / merchandise
+    "figurina", "figurine", "figure", "funko", "pop vinyl",
+    "artbook", "poster", "keychain", "breloc",
+    "mug", "cana", "tricou", "t shirt", "tshirt",
+    # Audio / OST / guides (not the game)
+    "soundtrack", "coloana sonora", "strategy guide",
+    # Stands / controllers / peripherals
+    "stand", "headset", "casca",
+    # DLC / season passes (base-game search shouldn't pick these up)
+    "dlc", "season pass", "expansion pass",
+)
+
+_ACCESSORY_RE = re.compile(
+    r"\b(" + "|".join(re.escape(m) for m in ACCESSORY_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_accessory(text_norm: str) -> bool:
+    """True if the title describes an accessory, merchandise, or DLC rather
+    than the game itself. Used to drop false matches where a case/figurine/OST
+    carries the game's name."""
+    return bool(_ACCESSORY_RE.search(text_norm))
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -183,6 +219,9 @@ def pre_filter_matches(query: str, title: str, url: str = "") -> bool:
         return False
     if not all_query_tokens_present(q_norm, t_norm):
         return False
+    # Accessory/merch filter — only reject when the query isn't itself an accessory.
+    if detect_accessory(t_norm) and not detect_accessory(q_norm):
+        return False
     q_editions = detect_editions(q_norm)
     if q_editions:
         t_editions = detect_editions(t_norm)
@@ -204,6 +243,7 @@ def match(query: str, candidates: list[Candidate]) -> MatchResult:
     q_norm = _norm(query)
     q_editions = detect_editions(q_norm)
     q_wants_used: bool | None = True if detect_used(q_norm) else None
+    q_is_accessory = detect_accessory(q_norm)
 
     # Per-candidate pre-processing
     enriched: list[tuple[Candidate, str, set[str], float]] = []
@@ -219,7 +259,12 @@ def match(query: str, candidates: list[Candidate]) -> MatchResult:
         if not all_query_tokens_present(q_norm, t_norm):
             continue
 
-        # 3) edition filter
+        # 3) accessory/merch filter — drop cases, grips, figurines, DLC, OSTs, etc.
+        #    unless the user was explicitly searching for an accessory.
+        if detect_accessory(t_norm) and not q_is_accessory:
+            continue
+
+        # 4) edition filter
         t_editions = detect_editions(t_norm)
         if q_editions:
             if not q_editions.issubset(t_editions):
