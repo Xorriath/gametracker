@@ -25,6 +25,15 @@ STOPWORDS: frozenset[str] = frozenset({
     "the", "a", "an", "and", "edition", "standard",
 })
 
+# Tokens that disambiguate game versions but that some storefronts drop from
+# the official title (e.g. PS Store calls "Resident Evil 4 Remake" just
+# "Resident Evil 4" — Capcom rebranded on the storefront). Treat these as
+# OPTIONAL for token-coverage: a candidate missing them isn't disqualified, but
+# candidates that DO contain them are preferred via the match sort key.
+SOFT_TOKENS: frozenset[str] = frozenset({
+    "remake", "remaster", "remastered",
+})
+
 # Order matters for detection — longer/more specific keywords first.
 EDITION_KEYWORDS: tuple[str, ...] = (
     "deluxe steelbook",
@@ -44,6 +53,11 @@ EDITION_KEYWORDS: tuple[str, ...] = (
     "gold",
     "deluxe",
     "game key card",
+    # Multi-game bundles — also non-base, so a "Trilogy" or "Collection" SKU
+    # never outranks the standalone game when the user queries the standalone.
+    "trilogy",
+    "bundle",
+    "collection",
     "standard",
 )
 
@@ -83,16 +97,22 @@ ACCESSORY_MARKERS: tuple[str, ...] = (
     "figurina", "figurine", "figure", "funko", "pop vinyl",
     "artbook", "poster", "keychain", "breloc",
     "mug", "cana", "tricou", "t shirt", "tshirt",
+    # PS Store in-game cosmetic DLC packs (very common, all carry the game name)
+    "charm", "costume", "ticket", "accessory", "accessoire",
     # Audio / OST / guides (not the game)
     "soundtrack", "coloana sonora", "strategy guide",
     # Stands / controllers / peripherals
     "stand", "headset", "casca",
-    # DLC / season passes (base-game search shouldn't pick these up)
+    # DLC / season passes / upgrades (base-game search shouldn't pick these up)
     "dlc", "season pass", "expansion pass",
+    "add on", "add-on", "addon",
+    "upgrade",  # PS Store "Digital Deluxe Edition Upgrade", cross-gen upgrades, etc.
 )
 
 _ACCESSORY_RE = re.compile(
-    r"\b(" + "|".join(re.escape(m) for m in ACCESSORY_MARKERS) + r")\b",
+    # Allow an optional 's' or 'es' suffix so "costumes"/"charms"/"accessories"
+    # match the singular markers without us having to enumerate plurals.
+    r"\b(" + "|".join(re.escape(m) for m in ACCESSORY_MARKERS) + r")(?:s|es)?\b",
     re.IGNORECASE,
 )
 
@@ -158,10 +178,17 @@ def detect_used(text_norm: str) -> bool:
 def _significant_tokens(text_norm: str) -> list[str]:
     # Keep short numeric tokens (sequel numbers like "4" in "Ninja Gaiden 4")
     # that would otherwise be filtered out by the length-2 cutoff.
+    # SOFT_TOKENS are excluded too — coverage shouldn't fail just because a
+    # storefront dropped a "remake" suffix. Soft tokens are still used as a
+    # ranking signal in `match()` to prefer candidates that DO carry them.
     return [
         t for t in text_norm.split()
-        if t not in STOPWORDS and (len(t) >= 2 or t.isdigit())
+        if t not in STOPWORDS and t not in SOFT_TOKENS and (len(t) >= 2 or t.isdigit())
     ]
+
+
+def _query_soft_tokens(query_norm: str) -> set[str]:
+    return {t for t in query_norm.split() if t in SOFT_TOKENS}
 
 
 def _adjacent_pairs_present(query_norm: str, title_norm: str) -> bool:
@@ -244,9 +271,10 @@ def match(query: str, candidates: list[Candidate]) -> MatchResult:
     q_editions = detect_editions(q_norm)
     q_wants_used: bool | None = True if detect_used(q_norm) else None
     q_is_accessory = detect_accessory(q_norm)
+    q_soft = _query_soft_tokens(q_norm)
 
     # Per-candidate pre-processing
-    enriched: list[tuple[Candidate, str, set[str], float]] = []
+    enriched: list[tuple[Candidate, str, set[str], float, int]] = []
     for c in candidates:
         t_norm = _norm(c.title)
         platform_text = _norm(f"{c.title} {c.url or ''}")
@@ -279,15 +307,27 @@ def match(query: str, candidates: list[Candidate]) -> MatchResult:
         if score < MIN_SCORE:
             continue
 
-        enriched.append((c, t_norm, t_editions, score))
+        # Soft-token coverage: query "Resident Evil 4 Remake" prefers candidates
+        # whose titles also contain "remake" over candidates that omit it.
+        # Penalty=0 when query has no soft tokens or the candidate carries them
+        # all; penalty=1 when the candidate is missing one or more.
+        soft_penalty = 0 if (not q_soft or q_soft.issubset(set(t_norm.split()))) else 1
+        enriched.append((c, t_norm, t_editions, score, soft_penalty))
 
     if not enriched:
         return MatchResult(winners=[])
 
-    def sort_key(item: tuple[Candidate, str, set[str], float]) -> tuple[float, int, float]:
-        c, _t, edns, score = item
+    def sort_key(
+        item: tuple[Candidate, str, set[str], float, int],
+    ) -> tuple[int, int, float, float]:
+        c, _t, edns, score, soft_penalty = item
         is_non_base = 0 if (not edns or _BASE_EDITION_SENTINEL in edns) else 1
-        return (c.price_ron, is_non_base, -score)
+        # Base editions always beat non-base — matching the base game is
+        # semantically correct even if a Deluxe/Premium tier happens to be on
+        # sale for less. Within the same edition tier: prefer titles that carry
+        # the query's soft tokens (e.g. "remake"), then cheapest, then highest
+        # fuzzy score.
+        return (is_non_base, soft_penalty, c.price_ron, -score)
 
     winners: list[Candidate] = []
     for used_flag in (False, True):

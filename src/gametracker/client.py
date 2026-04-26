@@ -59,6 +59,7 @@ SITE_COOLDOWN_DEFAULTS: dict[str, float] = {
     "ozone": 5.0,
     "buy2play": 5.0,
     "jocurinoi": 5.0,
+    "psstore": 8.0,
 }
 
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from gametracker.sites import buy2play, jocurinoi, ozone
+from gametracker.sites import buy2play, jocurinoi, ozone, psstore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -51,3 +51,27 @@ def test_buy2play_sh_detection():
     assert buy2play.is_used("Joc Resident Evil 6 pentru Xbox 360 Second-Hand SH")
     assert buy2play.is_used("Joc FIFA 23 SH")
     assert not buy2play.is_used("Joc nou FIFA 23 pentru PS5")
+
+
+def test_psstore_parses_search_results():
+    html = (FIXTURES / "psstore_astro_bot.html").read_text()
+    cands = psstore.parse_search_results(html)
+    # Fixture should yield at least the base Astro Bot plus a few other PS5 games.
+    assert len(cands) >= 3
+    # All candidates must be PS5-marked, have positive price, and a /en-ro/product/ URL.
+    for c in cands:
+        assert c.price_ron > 0
+        assert c.url.startswith("https://store.playstation.com/en-ro/product/")
+        assert "PS5" in c.title.upper()
+        assert not c.is_used  # PS Store doesn't sell SH
+    # The base game must be present at its known PS Store price (339.90 RON).
+    base = [c for c in cands if c.title.upper().startswith("ASTRO BOT (")]
+    assert base, "Base 'ASTRO BOT' tile missing"
+    assert abs(base[0].price_ron - 339.90) < 0.01
+    # Per-tile type-label filter must drop the "Digital Deluxe Edition Upgrade"
+    # tile at parse time (it carries an "Add-on" label, not a game).
+    titles_upper = " | ".join(c.title.upper() for c in cands)
+    assert "UPGRADE" not in titles_upper, (
+        "Upgrade/Add-on tiles should be filtered at parse time, "
+        f"got: {titles_upper}"
+    )

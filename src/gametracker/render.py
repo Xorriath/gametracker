@@ -1,6 +1,8 @@
 """Rich table rendering for check results."""
 from __future__ import annotations
 
+from typing import Any
+
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -184,6 +186,78 @@ def _classify_reason(status: str, error: str | None) -> str:
     return status or "error"
 
 
+def render_new_lows(
+    games: list[tuple[str, list[DisplayRow]]],
+    console: Console,
+    *,
+    prior_global_lows: dict[tuple[str, bool], tuple[float, str, str]] | None = None,
+) -> None:
+    """List games that just hit a new cross-site historic low.
+
+    For each (game, variant), find the cheapest fresh observation in this run
+    (not from cache, not a first-check) and compare it to the prior cross-site
+    low captured before the run started. If the fresh price beats the prior
+    global low, that's a real "new low across everything I track" — what a
+    favorites run summary actually wants to surface.
+
+    `prior_global_lows` maps (display_query, is_used) -> (price, site, scraped_at)
+    for the cheapest observation across ALL sites BEFORE the run. Rows missing
+    from the dict are treated as never-seen-before (skipped — first-check
+    semantics are surfaced elsewhere).
+    """
+    snapshot = prior_global_lows or {}
+    # (display, is_used) -> cheapest fresh DisplayRow this run
+    fresh_min: dict[tuple[str, bool], DisplayRow] = {}
+    for display, rows in games:
+        for r in rows:
+            if r.status != "ok" or r.from_cache:
+                continue
+            if r.price_ron is None:
+                continue
+            key = (display, r.is_used)
+            cur = fresh_min.get(key)
+            if cur is None or r.price_ron < cur.price_ron:
+                fresh_min[key] = r
+
+    hits: list[tuple[str, str, bool, float, float, str]] = []
+    for (display, is_used), winner in fresh_min.items():
+        prior = snapshot.get((display, is_used))
+        if prior is None:
+            # No prior baseline → not a "new low" in the cross-site sense; this
+            # is the first time we have any data for this game/variant.
+            continue
+        prior_price, prior_site, _prior_at = prior
+        if winner.price_ron is not None and winner.price_ron < prior_price - 0.005:
+            hits.append((
+                display, winner.site, is_used, winner.price_ron,
+                prior_price, prior_site,
+            ))
+
+    if not hits:
+        console.print("\n[dim]No new historic lows in this run.[/dim]")
+        return
+
+    console.print(f"\n[bold green]New historic lows[/bold green] ({len(hits)})\n")
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("Game", overflow="fold", max_width=45, style="cyan")
+    table.add_column("Site", style="yellow")
+    table.add_column("Variant", style="dim")
+    table.add_column("New low", justify="right", style="green")
+    table.add_column("Previous", justify="right")
+    table.add_column("on", style="dim")
+    table.add_column("Δ", justify="right", style="green")
+
+    hits.sort(key=lambda h: (h[0].lower(), h[1], h[2]))
+    for display, site, is_used, price, prior, prior_site in hits:
+        delta = price - prior
+        table.add_row(
+            display, site, "SH" if is_used else "new",
+            f"{price:.2f}", f"{prior:.2f}", prior_site,
+            f"−{abs(delta):.2f}",
+        )
+    console.print(table)
+
+
 def _fmt_duration(seconds: float) -> str:
     """Format a wall-clock duration compactly: '4.2s', '1m 12s', '1h 03m 05s'."""
     if seconds < 0:
@@ -299,9 +373,19 @@ def _render_summary_rows(
     console: Console,
     *,
     global_lows: dict[tuple[str, bool], tuple[float, str, str]] | None = None,
+    sort_by_price: bool = False,
 ) -> None:
-    """One row per (game, condition) — used for single-game best lookups."""
-    console.print("\n[bold]Best price per game[/bold]\n")
+    """One row per (game, condition).
+
+    Default ordering groups rows by site (cheapest-on-altex first, then within
+    each site by price). With sort_by_price, all rows are flattened and sorted
+    purely by price ascending — useful for "what's the cheapest thing I'm
+    tracking right now, regardless of site or game?"
+    """
+    title = "Best price per game"
+    if sort_by_price:
+        title += "  [dim](sorted by price)[/dim]"
+    console.print(f"\n[bold]{title}[/bold]\n")
     table = Table(show_header=True, header_style="bold", box=None)
     table.add_column("Game", overflow="fold", max_width=55, style="cyan")
     table.add_column("Site", style="yellow")
@@ -329,7 +413,11 @@ def _render_summary_rows(
         if not any_row:
             no_match.append(display)
 
-    matched.sort(key=lambda t: (t[0], t[2], t[1]))
+    if sort_by_price:
+        # price first, then game name as tiebreaker so identical prices are stable
+        matched.sort(key=lambda t: (t[2], t[1].lower(), t[0]))
+    else:
+        matched.sort(key=lambda t: (t[0], t[2], t[1]))
     for site_label, game, price, seen_at, low, low_site, low_at in matched:
         table.add_row(
             game, site_label, f"{price:.2f}",
@@ -426,6 +514,7 @@ def render_summary(
     *,
     single_game: bool = False,
     global_lows: dict[tuple[str, bool], tuple[float, str, str]] | None = None,
+    sort_by_price: bool = False,
 ) -> None:
     """Render the best-price summary.
 
@@ -435,12 +524,18 @@ def render_summary(
     single_game=False → one row per game with dedicated SH columns. Used for
     multi-game overviews (`gametracker best`, `gametracker favorites --summary`).
 
+    sort_by_price=True → forces the row format and orders all rows by price
+    ascending across all games and variants. Overrides single_game's column
+    layout because columns can't represent a price-ordered flat list.
+
     global_lows maps (display_query, is_used) → (price, site) for the all-time
     cheapest observation across sites. When present, the historic-low column
     shows that cross-site low plus the site that recorded it.
     """
-    if single_game:
-        _render_summary_rows(games, console, global_lows=global_lows)
+    if sort_by_price or single_game:
+        _render_summary_rows(
+            games, console, global_lows=global_lows, sort_by_price=sort_by_price,
+        )
     else:
         _render_summary_columns(games, console, global_lows=global_lows)
 
@@ -640,6 +735,8 @@ def render_graph(
     observations: list of db.Observation — pre-filtered to status='ok' with price.
     site_filter: optional site name to restrict the plot to one series.
     """
+    import sys
+
     import plotext as plt
 
     console.print(f"\n[bold]{display_query}[/bold]  [dim](PS5, price evolution)[/dim]\n")
@@ -668,27 +765,68 @@ def render_graph(
 
     plt.clf()
     plt.date_form("Y-m-d")
-    plt.theme("clear")
-    # Plotext picks its own terminal size by default; cap the height so the chart
-    # stays scannable even on very tall terminals.
+    # `pro` emits per-series ANSI colors without forcing a background — `clear`
+    # is monochrome despite the name, `default` paints a white background that
+    # fights with most terminal color schemes. We override colors per-series
+    # below to guarantee every site gets a visually distinct hue regardless of
+    # how many sites are tracked.
+    plt.theme("pro")
+    # Plotext picks its own terminal size by default; cap the height so the
+    # chart stays scannable even on very tall terminals.
     try:
         term_w = console.size.width
     except Exception:
         term_w = 100
-    plt.plotsize(max(60, min(term_w, 140)), 22)
+    # Leave 2 columns of slack — plotext's right-edge padding can otherwise spill
+    # the trailing ANSI reset into the next line when sized to the exact width.
+    plt.plotsize(max(60, min(term_w - 2, 140)), 22)
 
+    # Per-site color assignments — pinned so charts stay visually consistent
+    # between runs and easy to read at a glance ("altex is always yellow").
+    # 256-color integer codes are used because plotext's named-color set is
+    # sparse: "yellow"/"white+" silently fall back to blue/green and "orange+"
+    # actually emits the same code as bright yellow. Integer codes give us
+    # true, distinct hues. Sites not in this map fall back to the cycling
+    # palette below, so adding a new scraper Just Works visually until you
+    # decide on its color.
+    _SITE_COLORS: dict[str, Any] = {
+        "altex":     226,  # vivid yellow
+        "buy2play":  46,   # lime green
+        "emag":      33,   # azure blue
+        "flanco":    51,   # turquoise
+        "jocurinoi": 196,  # bright red
+        "ozone":     208,  # true orange (distinct from yellow)
+        "psstore":   129,  # purple (distinct from pink/magenta)
+        "trendyol":  15,   # white
+    }
+    _FALLBACK_PALETTE: tuple[Any, ...] = (201, 165, 214, 87, 159, 213)
+    fallback_idx = 0
     for label, pts in sorted(series.items()):
+        # Strip the optional " (SH)" suffix to look up the base site color, so
+        # SH and new variants of the same site share a hue (matches how price
+        # tables already group them visually).
+        site_key = label.removesuffix(" (SH)")
+        if site_key in _SITE_COLORS:
+            color = _SITE_COLORS[site_key]
+        else:
+            color = _FALLBACK_PALETTE[fallback_idx % len(_FALLBACK_PALETTE)]
+            fallback_idx += 1
         pts.sort(key=lambda p: p[0])
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         if len(xs) == 1:
-            plt.scatter(xs, ys, label=label, marker="braille")
+            plt.scatter(xs, ys, label=label, marker="braille", color=color)
         else:
-            plt.plot(xs, ys, label=label, marker="braille")
+            plt.plot(xs, ys, label=label, marker="braille", color=color)
 
     plt.title(f"{display_query} — price (RON) over time")
     plt.xlabel("date")
     plt.ylabel("RON")
-    # plotext.build() returns the rendered chart as a string; print through the
-    # rich console so it lives in the same output stream as everything else.
-    console.print(plt.build())
+    # Bypass Rich for the chart output: plotext emits raw ANSI escape codes for
+    # the per-series colors, and Rich's `console.print()` interprets things
+    # like `[0m` (the reset code) as markup tags, eating the colors and
+    # leaving stray "[0m" text on screen. Writing straight to stdout preserves
+    # the escape sequences for the terminal.
+    sys.stdout.write(plt.build())
+    sys.stdout.write("\n")
+    sys.stdout.flush()

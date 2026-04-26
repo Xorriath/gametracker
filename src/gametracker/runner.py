@@ -117,6 +117,7 @@ async def run_check(
     cooldown_overrides: dict[str, float] | None = None,
     clients: dict[str, SiteClient] | None = None,
     progress: "ProgressFn | None" = None,
+    run_id: int | None = None,
 ) -> tuple[str, list[DisplayRow]]:
     """Run a lookup of `query` across `sites` (defaults to all). Returns (display_query, rows).
 
@@ -208,7 +209,7 @@ async def run_check(
                         strategy_used=site_result.strategy_used,
                         scraped_at=db.now_iso(),
                     )
-                    db.record_observation(conn, obs)
+                    db.record_observation(conn, obs, run_id=run_id)
                     row = _row_from_observation(
                         conn, s, obs, from_cache=False,
                         prior_low=prior_low, prior_count=prior_count,
@@ -228,7 +229,7 @@ async def run_check(
                     strategy_used=site_result.strategy_used,
                     scraped_at=db.now_iso(),
                 )
-                db.record_observation(conn, obs)
+                db.record_observation(conn, obs, run_id=run_id)
                 site_rows.append(_row_from_observation(conn, s, obs, from_cache=False))
                 final_status = "no_match"
         else:
@@ -244,7 +245,7 @@ async def run_check(
                 strategy_used=None,
                 scraped_at=db.now_iso(),
             )
-            db.record_observation(conn, obs)
+            db.record_observation(conn, obs, run_id=run_id)
             site_rows.append(_row_from_observation(conn, s, obs, from_cache=False))
 
         for r in site_rows:
@@ -264,43 +265,72 @@ async def run_favorites(
     cooldown_overrides: dict[str, float] | None = None,
     per_game_progress: Callable[[str, list[str]], "ProgressFn"] | None = None,
     on_game_complete: Callable[[str, list[DisplayRow]], None] | None = None,
+    target_sites_per_game: dict[str, list[str]] | None = None,
 ) -> list[tuple[str, list[DisplayRow]]]:
     """Check every favorite sequentially using long-lived per-site clients.
 
     Long-lived clients mean per-site cooldown state persists across games, so we
     never hit the same domain twice within its cooldown window.
+
+    `target_sites_per_game` (used by --fix-missing): if provided, restricts each
+    favorite to only the sites in its list (keyed by `normalized_query`). Games
+    not present in the dict are skipped entirely.
     """
     conn = db.connect()  # always open to read favorites
     favs = db.list_favorites(conn)
     if not favs:
+        conn.close()
         return []
-    conn.close()
 
     targeted = sites or list(REGISTRY.keys())
     targeted = [s for s in targeted if s in REGISTRY]
     if not targeted:
+        conn.close()
         return [(f.display_query, []) for f in favs]
+
+    if target_sites_per_game is not None:
+        favs = [f for f in favs if target_sites_per_game.get(f.normalized_query)]
+        if not favs:
+            conn.close()
+            return []
+
+    # Run lifecycle: tag every observation produced in this batch with one run id
+    # so `--fix-missing` can later identify exactly which (game, site) failed.
+    run_id = db.start_run(conn, "favorites")
+    conn.close()
 
     from contextlib import AsyncExitStack
 
     out: list[tuple[str, list[DisplayRow]]] = []
-    async with AsyncExitStack() as stack:
-        clients: dict[str, SiteClient] = {}
-        for s in targeted:
-            c = SiteClient(site_config(s, cooldown_overrides or {}))
-            clients[s] = await stack.enter_async_context(c)
+    try:
+        async with AsyncExitStack() as stack:
+            clients: dict[str, SiteClient] = {}
+            for s in targeted:
+                c = SiteClient(site_config(s, cooldown_overrides or {}))
+                clients[s] = await stack.enter_async_context(c)
 
-        for fav in favs:
-            pg = per_game_progress(fav.display_query, targeted) if per_game_progress else None
-            display, rows = await run_check(
-                fav.display_query,
-                sites=targeted,
-                force=force,
-                cooldown_overrides=cooldown_overrides,
-                clients=clients,
-                progress=pg,
-            )
-            out.append((display, rows))
-            if on_game_complete:
-                on_game_complete(display, rows)
+            for fav in favs:
+                game_sites = targeted
+                if target_sites_per_game is not None:
+                    allowed = set(target_sites_per_game.get(fav.normalized_query, []))
+                    game_sites = [s for s in targeted if s in allowed]
+                    if not game_sites:
+                        continue
+                pg = per_game_progress(fav.display_query, game_sites) if per_game_progress else None
+                display, rows = await run_check(
+                    fav.display_query,
+                    sites=game_sites,
+                    force=force,
+                    cooldown_overrides=cooldown_overrides,
+                    clients=clients,
+                    progress=pg,
+                    run_id=run_id,
+                )
+                out.append((display, rows))
+                if on_game_complete:
+                    on_game_complete(display, rows)
+    finally:
+        end_conn = db.connect()
+        db.end_run(end_conn, run_id)
+        end_conn.close()
     return out

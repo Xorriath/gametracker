@@ -21,7 +21,7 @@ def _default_db_path() -> Path:
 
 DB_PATH = _default_db_path()
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS favorites (
@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS favorites (
     normalized_query TEXT UNIQUE NOT NULL,
     display_query    TEXT NOT NULL,
     added_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS price_observations (
@@ -42,12 +49,28 @@ CREATE TABLE IF NOT EXISTS price_observations (
     is_used          INTEGER NOT NULL DEFAULT 0,
     status           TEXT NOT NULL,
     strategy_used    TEXT,
-    scraped_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    scraped_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    run_id           INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_obs_query_site ON price_observations(normalized_query, site);
 CREATE INDEX IF NOT EXISTS idx_obs_scraped_at ON price_observations(scraped_at);
+CREATE INDEX IF NOT EXISTS idx_runs_kind       ON runs(kind, id);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent migration for older DBs that pre-date schema v2.
+
+    Adds `run_id` to `price_observations` if missing, then ensures the related
+    index exists. Safe to run on fresh installs too — both operations are no-ops
+    when the column/index already exist.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(price_observations)").fetchall()}
+    if "run_id" not in cols:
+        conn.execute("ALTER TABLE price_observations ADD COLUMN run_id INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_run ON price_observations(run_id)")
+    conn.commit()
 
 
 @dataclass(frozen=True)
@@ -78,6 +101,7 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(p, detect_types=sqlite3.PARSE_DECLTYPES)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
 
@@ -119,19 +143,57 @@ def list_favorites(conn: sqlite3.Connection) -> list[Favorite]:
     return [Favorite(**dict(r)) for r in rows]
 
 
-def record_observation(conn: sqlite3.Connection, obs: Observation) -> None:
+def record_observation(
+    conn: sqlite3.Connection, obs: Observation, *, run_id: int | None = None,
+) -> None:
     conn.execute(
         """INSERT INTO price_observations
            (normalized_query, site, matched_title, price_ron, url, availability,
-            is_used, status, strategy_used, scraped_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            is_used, status, strategy_used, scraped_at, run_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             obs.normalized_query, obs.site, obs.matched_title, obs.price_ron,
             obs.url, obs.availability, int(obs.is_used), obs.status,
-            obs.strategy_used, obs.scraped_at,
+            obs.strategy_used, obs.scraped_at, run_id,
         ),
     )
     conn.commit()
+
+
+def start_run(conn: sqlite3.Connection, kind: str) -> int:
+    """Open a new run row and return its id. `kind` is e.g. 'favorites' or 'check'."""
+    cur = conn.execute("INSERT INTO runs(kind) VALUES (?)", (kind,))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def end_run(conn: sqlite3.Connection, run_id: int) -> None:
+    conn.execute(
+        "UPDATE runs SET ended_at = datetime('now') WHERE id = ?", (run_id,),
+    )
+    conn.commit()
+
+
+def latest_run_id(conn: sqlite3.Connection, kind: str) -> int | None:
+    """Most recently started run of the given kind, or None if no run yet."""
+    row = conn.execute(
+        "SELECT id FROM runs WHERE kind = ? ORDER BY id DESC LIMIT 1",
+        (kind,),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def failed_targets_for_run(
+    conn: sqlite3.Connection, run_id: int,
+) -> list[tuple[str, str]]:
+    """Return the (normalized_query, site) pairs that failed (blocked or error)
+    in the given run. Used by `--fix-missing` to retry only those slots."""
+    rows = conn.execute(
+        """SELECT DISTINCT normalized_query, site FROM price_observations
+           WHERE run_id = ? AND status IN ('blocked', 'error')""",
+        (run_id,),
+    ).fetchall()
+    return [(str(r["normalized_query"]), str(r["site"])) for r in rows]
 
 
 def latest_observation(

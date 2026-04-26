@@ -18,6 +18,7 @@ from .render import (
     render_errors,
     render_graph,
     render_history,
+    render_new_lows,
     render_run_summary,
     render_summary,
     render_table,
@@ -43,6 +44,7 @@ class CtxState:
         self.sites: list[str] | None = None
         self.verbose: bool = False
         self.cooldown: dict[str, float] = {}
+        self.fix_missing: bool = False
 
 
 def _parse_sites(value: str | None) -> list[str] | None:
@@ -83,12 +85,21 @@ def _root(
             help="Per-site cooldown overrides, e.g. 'altex=60,emag=15'."
         )
     ] = None,
+    fix_missing: Annotated[
+        bool,
+        typer.Option(
+            "--fix-missing",
+            help="For `favorites`: re-fetch only the (game, site) slots that "
+                 "failed in the previous favorites run.",
+        ),
+    ] = False,
 ) -> None:
     state = CtxState()
     state.force = force
     state.sites = _parse_sites(sites)
     state.verbose = verbose
     state.cooldown = _parse_cooldown(cooldown)
+    state.fix_missing = fix_missing
     ctx.obj = state
 
     level = logging.DEBUG if verbose else logging.WARNING
@@ -176,6 +187,48 @@ def favorites(
         if state.verbose:
             render_errors(rows, err_console)
 
+    # --fix-missing: derive the (game, site) targets from the previous favorites run.
+    target_sites_per_game: dict[str, list[str]] | None = None
+    if state.fix_missing:
+        with db.connect() as conn:
+            last_id = db.latest_run_id(conn, "favorites")
+            if last_id is None:
+                err_console.print(
+                    "[yellow]--fix-missing: no previous favorites run on record. "
+                    "Run `gametracker favorites` once first.[/yellow]"
+                )
+                raise typer.Exit(code=0)
+            failed = db.failed_targets_for_run(conn, last_id)
+            fav_set = {f.normalized_query for f in db.list_favorites(conn)}
+        target_sites_per_game = {}
+        for nq, s in failed:
+            if nq not in fav_set:
+                continue  # favorite was removed since the last run
+            target_sites_per_game.setdefault(nq, []).append(s)
+        if not target_sites_per_game:
+            console.print(
+                "[green]--fix-missing: no failures to retry from the previous run.[/green]"
+            )
+            return
+        total_targets = sum(len(v) for v in target_sites_per_game.values())
+        console.print(
+            f"[dim]--fix-missing: retrying {total_targets} site fetch(es) "
+            f"across {len(target_sites_per_game)} game(s) from run #{last_id}[/dim]"
+        )
+
+    # Snapshot the cross-site historic lows BEFORE the run, so we can tell
+    # which favorites genuinely set a new all-time low across every tracked
+    # site (rather than just a per-site low). Without this snapshot, by the
+    # time the run finishes, the just-recorded observations are already part
+    # of `historic_low_global`, hiding the "before" state.
+    prior_global_lows: dict[tuple[str, bool], tuple[float, str, str]] = {}
+    with db.connect() as conn:
+        for fav in db.list_favorites(conn):
+            for used_flag in (False, True):
+                gl = db.historic_low_global(conn, fav.normalized_query, used_flag)
+                if gl is not None:
+                    prior_global_lows[(fav.display_query, used_flag)] = gl
+
     started = time.monotonic()
     try:
         results = asyncio.run(
@@ -185,6 +238,7 @@ def favorites(
                 cooldown_overrides=state.cooldown,
                 per_game_progress=per_game_progress,
                 on_game_complete=on_game_complete,
+                target_sites_per_game=target_sites_per_game,
             )
         )
     finally:
@@ -198,6 +252,7 @@ def favorites(
         return
     if summary:
         render_summary(results, console)
+    render_new_lows(results, console, prior_global_lows=prior_global_lows)
     render_run_summary(results, console, elapsed_seconds=elapsed)
 
 
@@ -292,6 +347,14 @@ def best(
         str | None,
         typer.Argument(help="Optional: show best price for a single game only."),
     ] = None,
+    by_price: Annotated[
+        bool,
+        typer.Option(
+            "--by-price",
+            help="Show one row per (game, variant) sorted by price ascending, "
+                 "instead of grouped per site.",
+        ),
+    ] = False,
 ) -> None:
     """Show the best known price per game from the DB (no scraping)."""
     from .runner import DisplayRow  # local import to avoid a cycle
@@ -342,7 +405,12 @@ def best(
                     global_lows[(display_name, used_flag)] = gl
             games.append((display_name, rows))
 
-    render_summary(games, console, single_game=(game is not None), global_lows=global_lows)
+    render_summary(
+        games, console,
+        single_game=(game is not None),
+        global_lows=global_lows,
+        sort_by_price=by_price,
+    )
 
 
 @app.command(name="all")
